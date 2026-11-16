@@ -94,34 +94,33 @@ def search_client():
         TESTING=True,
     )
 
-    # Preserve the original database reference.
     original_db = mongo.db
 
-    # Authentication and search must use the same fake database.
-    mongo.db = db
-    app.extensions['pymongo'] = SimpleNamespace(db=db)
+    try:
+        mongo.db = db
+        app.extensions['pymongo'] = SimpleNamespace(db=db)
 
-    app.register_blueprint(search_bp, url_prefix='/api')
+        app.register_blueprint(search_bp, url_prefix='/api')
 
-    now = datetime.now(timezone.utc)
+        now = datetime.now(timezone.utc)
 
-    token = jwt.encode(
-        {
-            'sub': str(user_id),
-            'iat': now,
-            'exp': now + timedelta(hours=1),
-        },
-        app.config['SECRET_KEY'],
-        algorithm='HS256',
-    )
+        token = jwt.encode(
+            {
+                'sub': str(user_id),
+                'iat': now,
+                'exp': now + timedelta(hours=1),
+            },
+            app.config['SECRET_KEY'],
+            algorithm='HS256',
+        )
 
-    client = app.test_client()
-    client.environ_base['HTTP_AUTHORIZATION'] = f'Bearer {token}'
+        client = app.test_client()
+        client.environ_base['HTTP_AUTHORIZATION'] = f'Bearer {token}'
 
-    yield client, db.documents, division_id, other_division_id, user_id
+        yield client, db.documents, division_id, other_division_id, user_id
 
-    # Restore the original database reference.
-    mongo.db = original_db
+    finally:
+        mongo.db = original_db
 
 
 def make_document(division_id, **fields):
@@ -215,7 +214,6 @@ def test_search_is_division_isolated_but_allows_approved_cross_division_access(
         client.get('/api/search?q=shared')
     )
 
-    # Check permissions, not incidental sorting order.
     assert set(results) == {
         'Shared policy',
         'Approved shared policy',
