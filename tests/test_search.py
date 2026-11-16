@@ -117,7 +117,13 @@ def search_client():
         client = app.test_client()
         client.environ_base['HTTP_AUTHORIZATION'] = f'Bearer {token}'
 
-        yield client, db.documents, division_id, other_division_id, user_id
+        yield (
+            client,
+            db.documents,
+            division_id,
+            other_division_id,
+            user_id,
+        )
 
     finally:
         mongo.db = original_db
@@ -149,7 +155,10 @@ def test_search_matches_document_title(search_client):
     client, collection, division_id, _, _ = search_client
 
     collection.documents.append(
-        make_document(division_id, title='Quarterly forecast')
+        make_document(
+            division_id,
+            title='Quarterly forecast',
+        )
     )
 
     assert result_titles(
@@ -213,6 +222,8 @@ def test_search_is_division_isolated_but_allows_approved_cross_division_access(
     results = result_titles(
         client.get('/api/search?q=shared')
     )
+
+    assert len(results) == 2
 
     assert set(results) == {
         'Shared policy',

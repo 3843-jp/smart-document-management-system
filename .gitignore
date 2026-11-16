@@ -1,10 +1,22 @@
+# Python
 __pycache__/
 *.py[cod]
 .venv/
 venv/
+
+# Environment and secrets
 .env
+.env.*
+!.env.example
+
+# Testing
 .pytest_cache/
+
+# Frontend
 node_modules/
 dist/
+
+# Temporary files
+s.py
 test_sample.pdf
 test_report.txt
