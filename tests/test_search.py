@@ -1,3 +1,4 @@
+
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -6,6 +7,7 @@ import pytest
 from bson import ObjectId
 from flask import Flask
 
+from app.db import mongo
 from app.routes.search import search_bp
 
 
@@ -34,16 +36,24 @@ class FakeDocuments:
         self.documents = documents
 
     def find(self, query, projection=None):
-        # Emulate Mongo's division-or-explicit-authorization access filter.
         clauses = query['$or']
+
         matching = [
             doc for doc in self.documents
             if any(
-                ('division_id' in clause and doc.get('division_id') == clause['division_id'])
-                or ('authorized_user_ids' in clause and clause['authorized_user_ids'] in doc.get('authorized_user_ids', []))
+                (
+                    'division_id' in clause
+                    and doc.get('division_id') == clause['division_id']
+                )
+                or (
+                    'authorized_user_ids' in clause
+                    and clause['authorized_user_ids']
+                    in doc.get('authorized_user_ids', [])
+                )
                 for clause in clauses
             )
         ]
+
         return FakeCursor(matching)
 
 
@@ -52,29 +62,66 @@ def search_client():
     user_id = ObjectId()
     division_id = ObjectId()
     other_division_id = ObjectId()
-    user = {'_id': user_id, 'division_id': division_id, 'active': True}
+
+    user = {
+        '_id': user_id,
+        'division_id': division_id,
+        'active': True,
+    }
+
     documents = []
-    divisions = SimpleNamespace(find_one=lambda query: {'name': 'Division'})
+
     db = SimpleNamespace(
-        users=SimpleNamespace(find_one=lambda query: user if query.get('_id') == user_id else None),
-        divisions=divisions,
+        users=SimpleNamespace(
+            find_one=lambda query: (
+                user
+                if query.get('_id') == user_id
+                and query.get('active') is True
+                else None
+            )
+        ),
+        divisions=SimpleNamespace(
+            find_one=lambda query: {'name': 'Division'}
+        ),
         documents=FakeDocuments(documents),
     )
 
     app = Flask(__name__)
-    app.config['SECRET_KEY'] = 'test-secret'
+
+    app.config.update(
+        SECRET_KEY='test-secret-key-for-jwt-at-least-32-bytes',
+        TOKEN_TTL_HOURS=1,
+        TESTING=True,
+    )
+
+    # Preserve the original database reference.
+    original_db = mongo.db
+
+    # Authentication and search must use the same fake database.
+    mongo.db = db
     app.extensions['pymongo'] = SimpleNamespace(db=db)
+
     app.register_blueprint(search_bp, url_prefix='/api')
 
     now = datetime.now(timezone.utc)
+
     token = jwt.encode(
-        {'sub': str(user_id), 'iat': now, 'exp': now + timedelta(hours=1)},
+        {
+            'sub': str(user_id),
+            'iat': now,
+            'exp': now + timedelta(hours=1),
+        },
         app.config['SECRET_KEY'],
         algorithm='HS256',
     )
+
     client = app.test_client()
     client.environ_base['HTTP_AUTHORIZATION'] = f'Bearer {token}'
-    return client, db.documents, division_id, other_division_id, user_id
+
+    yield client, db.documents, division_id, other_division_id, user_id
+
+    # Restore the original database reference.
+    mongo.db = original_db
 
 
 def make_document(division_id, **fields):
@@ -91,54 +138,106 @@ def make_document(division_id, **fields):
 
 
 def result_titles(response):
-    assert response.status_code == 200
-    return [document['title'] for document in response.get_json()['results']]
+    assert response.status_code == 200, response.get_json()
+
+    return [
+        document['title']
+        for document in response.get_json()['results']
+    ]
 
 
 def test_search_matches_document_title(search_client):
     client, collection, division_id, _, _ = search_client
-    collection.documents.append(make_document(division_id, title='Quarterly forecast'))
 
-    assert result_titles(client.get('/api/search?q=forecast')) == ['Quarterly forecast']
+    collection.documents.append(
+        make_document(division_id, title='Quarterly forecast')
+    )
+
+    assert result_titles(
+        client.get('/api/search?q=forecast')
+    ) == ['Quarterly forecast']
 
 
 def test_search_matches_ocr_extracted_text(search_client):
     client, collection, division_id, _, _ = search_client
-    collection.documents.append(make_document(division_id, title='Scanned report', extracted_text='Payment received'))
 
-    assert result_titles(client.get('/api/search?q=payment')) == ['Scanned report']
+    collection.documents.append(
+        make_document(
+            division_id,
+            title='Scanned report',
+            extracted_text='Payment received',
+        )
+    )
+
+    assert result_titles(
+        client.get('/api/search?q=payment')
+    ) == ['Scanned report']
 
 
 def test_search_matches_dynamic_metadata_values(search_client):
     client, collection, division_id, _, _ = search_client
-    collection.documents.append(make_document(division_id, title='Invoice', metadata={'project_code': 'Orchid-42'}))
 
-    assert result_titles(client.get('/api/search?q=orchid')) == ['Invoice']
+    collection.documents.append(
+        make_document(
+            division_id,
+            title='Invoice',
+            metadata={'project_code': 'Orchid-42'},
+        )
+    )
+
+    assert result_titles(
+        client.get('/api/search?q=orchid')
+    ) == ['Invoice']
 
 
-def test_search_is_division_isolated_but_allows_approved_cross_division_access(search_client):
+def test_search_is_division_isolated_but_allows_approved_cross_division_access(
+    search_client,
+):
     client, collection, division_id, other_division_id, user_id = search_client
+
     collection.documents.extend([
-        make_document(division_id, title='Shared policy'),
+        make_document(
+            division_id,
+            title='Shared policy',
+        ),
         make_document(
             other_division_id,
             title='Approved shared policy',
             authorized_user_ids=[user_id],
         ),
-        make_document(other_division_id, title='Private shared policy'),
+        make_document(
+            other_division_id,
+            title='Private shared policy',
+        ),
     ])
 
-    assert result_titles(client.get('/api/search?q=shared')) == [
-        'Approved shared policy',
+    results = result_titles(
+        client.get('/api/search?q=shared')
+    )
+
+    # Check permissions, not incidental sorting order.
+    assert set(results) == {
         'Shared policy',
-    ]
+        'Approved shared policy',
+    }
+
+    assert 'Private shared policy' not in results
 
 
 def test_search_escapes_regex_metacharacters(search_client):
     client, collection, division_id, _, _ = search_client
+
     collection.documents.extend([
-        make_document(division_id, title='Literal .* document'),
-        make_document(division_id, title='Any matching document'),
+        make_document(
+            division_id,
+            title='Literal .* document',
+        ),
+        make_document(
+            division_id,
+            title='Any matching document',
+        ),
     ])
 
-    assert result_titles(client.get('/api/search?q=.*')) == ['Literal .* document']
+    assert result_titles(
+        client.get('/api/search?q=.*')
+    ) == ['Literal .* document']
